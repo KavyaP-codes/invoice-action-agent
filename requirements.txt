@@ -7,3 +7,4 @@ pydantic
 pydantic-settings
 httpx
 openai
+google-genai
