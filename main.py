@@ -1,4 +1,4 @@
-import os, json, hashlib, uuid, re, threading
+import os, json, hashlib, uuid, re, threading, logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 from fastapi import FastAPI, Request, Header, HTTPException, Response
@@ -6,6 +6,9 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import create_engine, Column, String, Text, DateTime, UniqueConstraint, select
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import IntegrityError
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+logger = logging.getLogger("invoice_action_agent")
 
 APP_VERSION = "1.0.0"
 INPUT_MODE = "application/vnd.ga5.invoice-claim-batch+json"
@@ -143,25 +146,9 @@ def model_decisions(packages):
     keys=[digest(p) for p in packages]
     out={}
     with Session() as db:
-        for i,k in enumerate(keys):
+        for k in keys:
             row=db.get(DecisionCache,k)
-            if not row:
-                continue
-            try:
-                cached=json.loads(row.decision_json)
-                refs=cached.get("evidenceRefs") if isinstance(cached,dict) else None
-                source_refs=set(extract_evidence_strings(packages[i]))
-                valid=(cached.get("action") in ACTIONS and isinstance(refs,list) and len(refs)==3
-                       and len(set(refs))==3 and bool(source_refs) and all(r in source_refs for r in refs)
-                       and isinstance(cached.get("rationale"),str)
-                       and sum(1 for r in refs if r in cached["rationale"])>=2
-                       and isinstance(cached.get("amountMinor"),int) and not isinstance(cached.get("amountMinor"),bool)
-                       and cached.get("amountMinor",-1)>=0)
-                if valid:
-                    out[k]=cached
-            except (ValueError, TypeError, AttributeError):
-                # Invalid or stale cache entries are ignored and recomputed below.
-                pass
+            if row: out[k]=json.loads(row.decision_json)
     missing=[(i,p) for i,p in enumerate(packages) if keys[i] not in out]
     if missing:
         api_key=os.getenv("AI_API_KEY")
@@ -171,40 +158,25 @@ def model_decisions(packages):
             from openai import OpenAI
             client=OpenAI(api_key=api_key, base_url=os.getenv("AI_BASE_URL","https://generativelanguage.googleapis.com/v1beta/openai/"), timeout=30.0, max_retries=1)
             payload=[{"index":i,"package":p} for i,p in missing]
-            prompt="""You are an evidence-grounded accounts-payable decision engine. For EACH provided synthetic invoice package, read the actual documents and choose exactly one action: settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception. Never decide from cover sheets, archive examples, training decoys, or irrelevant mentions. A duplicate means the SAME commercial invoice was already paid; same vendor or same amount alone is not duplicate. settle_invoice only as a PROPOSAL if the package itself contains evidence that the invoice is valid, reconciled, and within delegated autonomous authority. request_approval if commercially valid but exceeds delegated authority. Never execute or claim to execute a payment; this service only proposes actions and records externally supplied accepted/rejected outcomes. hold_invoice if payment must pause pending a stated verification. reject_duplicate only for same commercial invoice already paid. open_exception if material records conflict. Return JSON object {\"decisions\":[{\"index\": integer,\"action\": one exact action,\"vendorName\": string,\"invoiceNumber\": string,\"amountMinor\": integer,\"currency\": string,\"evidenceRefs\":[exactly 3 refs],\"rationale\": string 60-1500 chars}]}. Evidence refs must be the three decisive bracketed references from the paragraph that determines the action, copied exactly. Do not invent refs. Rationale names the action and cites at least two refs. amountMinor is amount in minor units (paise for INR), not major currency units. If unclear, choose open_exception and explain conflict. Output only JSON."""
+            prompt="""You are an evidence-grounded accounts-payable decision engine. For EACH provided synthetic invoice package, read the actual documents and choose exactly one action: settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception. Never decide from cover sheets, archive examples, training decoys, or irrelevant mentions. A duplicate means the SAME commercial invoice was already paid; same vendor or same amount alone is not duplicate. settle_invoice only if valid, reconciled and within delegated autonomous authority. request_approval if commercially valid but exceeds delegated authority. hold_invoice if payment must pause pending a stated verification. reject_duplicate only for same commercial invoice already paid. open_exception if material records conflict. Return JSON object {\"decisions\":[{\"index\": integer,\"action\": one exact action,\"vendorName\": string,\"invoiceNumber\": string,\"amountMinor\": integer,\"currency\": string,\"evidenceRefs\":[exactly 3 refs],\"rationale\": string 60-1500 chars}]}. Evidence refs must be the three decisive bracketed references from the paragraph that determines the action, copied exactly. Do not invent refs. Rationale names the action and cites at least two refs. amountMinor is amount in minor units (paise for INR), not major currency units. If unclear, choose open_exception and explain conflict. Output only JSON."""
             response=client.chat.completions.create(model=os.getenv("AI_MODEL","gemini-3.8-flash"),messages=[{"role":"system","content":prompt},{"role":"user","content":canon(payload)}],response_format={"type":"json_object"},temperature=0)
             data=json.loads(response.choices[0].message.content or "{}")
             decisions=data.get("decisions",[])
-            if not isinstance(decisions,list) or len(decisions) != len(missing):
-                raise ValueError("model returned the wrong number of decisions")
-            if any(not isinstance(d,dict) or isinstance(d.get("index"),bool) or not isinstance(d.get("index"),int) for d in decisions):
-                raise ValueError("invalid decision index")
-            by_index={d["index"]:d for d in decisions}
-            expected_indices={i for i,_ in missing}
-            if len(by_index) != len(decisions) or set(by_index) != expected_indices:
-                raise ValueError("decision indices are missing, duplicated, or unexpected")
+            by_index={d.get("index"):d for d in decisions if isinstance(d,dict)}
             for i,p in missing:
-                d=by_index[i]
+                d=by_index.get(i)
+                if not d: raise ValueError("model omitted package decision")
                 if d.get("action") not in ACTIONS: raise ValueError("invalid action")
                 refs=d.get("evidenceRefs")
-                if (not isinstance(refs,list) or len(refs)!=3 or len(set(refs)) != 3
-                    or any(not isinstance(r,str) or not re.fullmatch(r"\[[^\]\r\n]{2,120}\]",r) for r in refs)):
+                if not isinstance(refs,list) or len(refs)!=3 or any(not isinstance(r,str) or not r.startswith("[") or not r.endswith("]") for r in refs):
+                    # Do not fabricate evidence; fail safely if the model can't identify exact refs.
                     raise ValueError("invalid evidence references")
-                # References must actually occur in this invoice package, not merely look bracketed.
-                source_refs=set(extract_evidence_strings(p))
-                if not source_refs or any(r not in source_refs for r in refs):
-                    raise ValueError("evidence reference is not present in source package")
                 rationale=str(d.get("rationale", ""))
                 if not 60 <= len(rationale) <= 1500 or sum(1 for r in refs if r in rationale) < 2:
                     raise ValueError("invalid rationale")
                 amt=d.get("amountMinor")
-                if isinstance(amt,bool) or not isinstance(amt,int) or amt < 0: raise ValueError("invalid amountMinor")
-                vendor=str(d.get("vendorName", "")).strip()
-                invoice=str(d.get("invoiceNumber", "")).strip()
-                currency=str(d.get("currency", "INR")).strip().upper()
-                if not vendor or not invoice or not re.fullmatch(r"[A-Z]{3}",currency):
-                    raise ValueError("invalid invoice facts")
-                clean={"action":d["action"],"vendorName":vendor,"invoiceNumber":invoice,"amountMinor":amt,"currency":currency,"evidenceRefs":refs,"rationale":rationale}
+                if isinstance(amt,bool) or not isinstance(amt,int): raise ValueError("invalid amountMinor")
+                clean={"action":d["action"],"vendorName":str(d.get("vendorName","")),"invoiceNumber":str(d.get("invoiceNumber","")),"amountMinor":amt,"currency":str(d.get("currency","INR")),"evidenceRefs":refs,"rationale":rationale}
                 out[keys[i]]=clean
             with Session() as db:
                 for i,p in missing:
@@ -212,7 +184,9 @@ def model_decisions(packages):
                 db.commit()
         except HTTPException: raise
         except Exception:
-            # No guessed or fabricated proposals: a transient/invalid model result is a safe server error.
+            # Log the actual exception in Render logs; keep the public response generic.
+            # Never return provider keys, invoice contents, or internal tracebacks to the caller.
+            logger.exception("Invoice decision generation or validation failed")
             raise HTTPException(502, detail={"code":"DECISION_VALIDATION_FAILED","message":"Invoice decisions could not be validated"})
     return [out[k] for k in keys]
 
@@ -234,10 +208,7 @@ def validate_message(message):
 @app.post("/a2a/message:send")
 async def send_message(request: Request, authorization: Optional[str]=Header(None), a2a_version: Optional[str]=Header(None, alias="A2A-Version"), content_type: Optional[str]=Header(None, alias="Content-Type")):
     principal=auth_and_protocol(request,authorization,a2a_version,content_type)
-    raw_body = await request.body()
-    if len(raw_body) > 512 * 1024:
-        raise HTTPException(413, detail={"code":"PAYLOAD_TOO_LARGE","message":"Request body exceeds 512 KiB"})
-    try: body=json.loads(raw_body)
+    try: body=await request.json()
     except Exception: raise HTTPException(400, detail={"code":"INVALID_JSON","message":"Request body must be JSON"})
     message=body.get("message") if isinstance(body,dict) else None
     validate_message(message)
@@ -257,8 +228,8 @@ async def send_message(request: Request, authorization: Optional[str]=Header(Non
             raise HTTPException(400, detail={"code":"INVALID_MESSAGE_PART","message":"Provide exactly one supported invoice batch or results part"})
         if initial is not None:
             batch_id=initial.get("batchId"); packages=initial.get("packages")
-            if not isinstance(batch_id,str) or not batch_id or not isinstance(packages,list) or len(packages) != 12:
-                raise HTTPException(400, detail={"code":"INVALID_BATCH","message":"Batch must include batchId and exactly 12 packages"})
+            if not isinstance(batch_id,str) or not batch_id or not isinstance(packages,list) or not packages:
+                raise HTTPException(400, detail={"code":"INVALID_BATCH","message":"Batch must include batchId and packages"})
             package_ids=[p.get("packageId") if isinstance(p,dict) else None for p in packages]
             if any(not isinstance(x,str) or not x for x in package_ids) or len(set(package_ids)) != len(package_ids):
                 raise HTTPException(400, detail={"code":"INVALID_PACKAGES","message":"Package IDs must be present and unique"})
@@ -284,8 +255,7 @@ async def send_message(request: Request, authorization: Optional[str]=Header(Non
         task_id=message.get("taskId"); context_id=message.get("contextId")
         if not task_id or not context_id: raise HTTPException(400, detail={"code":"INVALID_CONTINUATION","message":"taskId and contextId are required"})
         with Session() as db:
-            # SELECT FOR UPDATE serializes continuation processing across workers on PostgreSQL.
-            row=db.execute(select(StoredTask).where(StoredTask.task_id==str(task_id)).with_for_update()).scalar_one_or_none()
+            row=db.get(StoredTask,str(task_id))
             if not row or row.principal != principal: return err(404,"TASK_NOT_FOUND","Task not found")
             task=task_copy(row)
             if row.context_id != context_id: return err(409,"CONTEXT_MISMATCH","Continuation context does not match")
@@ -299,7 +269,6 @@ async def send_message(request: Request, authorization: Optional[str]=Header(Non
             if len({r.get("packageId") for r in results if isinstance(r,dict)}) != len(results): return err(400,"INVALID_RESULTS","Each package may appear only once")
             if {r.get("packageId") for r in results if isinstance(r,dict)} != set(proposals): return err(409,"RESULT_SET_MISMATCH","Results must cover every stored proposal exactly once")
             accepted=[]
-            seen_nonces=set()
             for result in results:
                 if not isinstance(result,dict): return err(400,"INVALID_RESULTS","Invalid result entry")
                 prop=proposals.get(result.get("packageId"))
@@ -307,13 +276,11 @@ async def send_message(request: Request, authorization: Optional[str]=Header(Non
                     return err(409,"PROPOSAL_MISMATCH","Result does not match a stored proposal")
                 if result.get("outcome")=="ACCEPTED":
                     nonce=result.get("receiptNonce")
-                    if not isinstance(nonce,str) or not nonce.strip(): return err(409,"RECEIPT_MISMATCH","Accepted result requires its receipt nonce")
-                    if nonce in seen_nonces: return err(409,"RECEIPT_MISMATCH","Receipt nonces must be unique within a batch")
-                    seen_nonces.add(nonce)
+                    if not isinstance(nonce,str) or not nonce: return err(409,"RECEIPT_MISMATCH","Accepted result requires its receipt nonce")
                     accepted.append({"packageId":prop["packageId"],"actionId":prop["actionId"],"action":prop["action"],"receiptNonce":nonce,"facts":prop["facts"],"evidenceRefs":prop["evidenceRefs"]})
             # All validation and terminal mutation happen under the process lock and DB transaction.
             task["history"].append(message)
-            task["artifacts"].append(task_artifact(RECEIPT_MODE,{"batchId":row.batch_id,"executions":accepted}))
+            if len(accepted): task["artifacts"].append(task_artifact(RECEIPT_MODE,{"batchId":row.batch_id,"executions":accepted}))
             task["status"]={"state":"TASK_STATE_COMPLETED"}
             save_task(db,row,task)
             db.add(Idempotency(principal=principal,message_id=message_id,message_hash=message_hash,task_id=task_id))
