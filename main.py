@@ -9,7 +9,7 @@ app = FastAPI(
 
 BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
-    "https://replace-after-deployment.onrender.com/a2a/",
+    "https://invoice-action-agent-1fbn.onrender.com/a2a/",
 )
 
 @app.get("/")
